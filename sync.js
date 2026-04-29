@@ -15,6 +15,21 @@
 require('dotenv').config();
 const SftpClient = require('ssh2-sftp-client');
 const ftp        = require('basic-ftp');
+
+// ─── Validate required env vars before doing anything ──────────────
+const REQUIRED = [
+  'SFTP_HOST','SFTP_USER','SFTP_PASS',
+  'SFTP_TIRES_PATH','SFTP_WHEELS_PATH',
+  'FTP_HOST','FTP_USER','FTP_PASS',
+  'FTP_TIRES_DIR','FTP_WHEELS_DIR',
+];
+const missing = REQUIRED.filter(k => !process.env[k]);
+if (missing.length > 0) {
+  console.error('❌ Missing required environment variables:');
+  missing.forEach(k => console.error(`   - ${k}`));
+  console.error('\nAdd these as GitHub Secrets or in your .env file.');
+  process.exit(1);
+}
 const cron       = require('node-cron');
 const fs         = require('fs');
 const path       = require('path');
