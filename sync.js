@@ -2,6 +2,7 @@
  * sync.js
  * ───────────────────────────────────────────────────────────────────
  * WheelPros SFTP  →  WheelsbelowRetail FTP  inventory feed sync
+ * Handles 2 files: TIRES and WHEELS (separate directories each)
  *
  * Usage:
  *   node sync.js          — starts the cron scheduler (keeps running)
@@ -24,8 +25,6 @@ const SFTP_CONFIG = {
   password: process.env.SFTP_PASS,
 };
 
-const SFTP_REMOTE_PATH = process.env.SFTP_REMOTE_PATH;
-
 const FTP_CONFIG = {
   host:     process.env.FTP_HOST,
   port:     parseInt(process.env.FTP_PORT || '21'),
@@ -33,88 +32,115 @@ const FTP_CONFIG = {
   password: process.env.FTP_PASS,
 };
 
-const FTP_REMOTE_DIR  = process.env.FTP_REMOTE_DIR  || '/';
-const CRON_SCHEDULE   = process.env.CRON_SCHEDULE   || '0 * * * *';
+// ─── File transfer jobs ────────────────────────────────────────────
+// Each entry: { label, sftpPath, ftpDir }
+const SYNC_JOBS = [
+  {
+    label:    'TIRES',
+    sftpPath: process.env.SFTP_TIRES_PATH,
+    ftpDir:   process.env.FTP_TIRES_DIR,
+  },
+  {
+    label:    'WHEELS',
+    sftpPath: process.env.SFTP_WHEELS_PATH,
+    ftpDir:   process.env.FTP_WHEELS_DIR,
+  },
+];
 
-// ─── Temp local file ───────────────────────────────────────────────
-const TMP_DIR       = path.join(__dirname, 'tmp');
-const LOCAL_FILE    = path.join(TMP_DIR, path.basename(SFTP_REMOTE_PATH || 'feed.csv'));
+const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '0 * * * *';
+
+// ─── Temp dir ──────────────────────────────────────────────────────
+const TMP_DIR = path.join(__dirname, 'tmp');
+if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
 
 // ─── Logging helper ────────────────────────────────────────────────
 function log(msg) {
-  const ts = new Date().toISOString();
+  const ts   = new Date().toISOString();
   const line = `[${ts}] ${msg}`;
   console.log(line);
   fs.appendFileSync(path.join(__dirname, 'sync.log'), line + '\n');
 }
 
-// ─── Ensure tmp dir exists ─────────────────────────────────────────
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
-
-// ─── Step 1: Download from SFTP ────────────────────────────────────
-async function downloadFromSftp() {
+// ─── Step 1: Download all files from SFTP (single connection) ──────
+async function downloadAllFromSftp(jobs) {
   const sftp = new SftpClient();
   try {
-    log(`[SFTP] Connecting to ${SFTP_CONFIG.host}:${SFTP_CONFIG.port} as ${SFTP_CONFIG.username}...`);
+    log(`[SFTP] Connecting to ${SFTP_CONFIG.host}:${SFTP_CONFIG.port}...`);
     await sftp.connect(SFTP_CONFIG);
+    log('[SFTP] ✅ Connected.');
 
-    log(`[SFTP] Downloading: ${SFTP_REMOTE_PATH} → ${LOCAL_FILE}`);
-    await sftp.fastGet(SFTP_REMOTE_PATH, LOCAL_FILE);
+    for (const job of jobs) {
+      const localFile = path.join(TMP_DIR, path.basename(job.sftpPath));
+      job.localFile   = localFile; // store for FTP upload step
 
-    const stats = fs.statSync(LOCAL_FILE);
-    log(`[SFTP] ✅ Download complete. File size: ${(stats.size / 1024).toFixed(1)} KB`);
+      log(`[SFTP][${job.label}] Downloading: ${job.sftpPath}`);
+      await sftp.fastGet(job.sftpPath, localFile);
+
+      const size = fs.statSync(localFile).size;
+      log(`[SFTP][${job.label}] ✅ Done — ${(size / 1024).toFixed(1)} KB`);
+    }
   } finally {
     await sftp.end();
     log('[SFTP] Connection closed.');
   }
 }
 
-// ─── Step 2: Upload to FTP ─────────────────────────────────────────
-async function uploadToFtp() {
+// ─── Step 2: Upload all files to FTP (single connection) ───────────
+async function uploadAllToFtp(jobs) {
   const client = new ftp.Client();
   client.ftp.verbose = false;
 
   try {
-    log(`[FTP] Connecting to ${FTP_CONFIG.host}:${FTP_CONFIG.port} as ${FTP_CONFIG.user}...`);
+    log(`[FTP] Connecting to ${FTP_CONFIG.host}:${FTP_CONFIG.port}...`);
     await client.access(FTP_CONFIG);
+    log('[FTP] ✅ Connected.');
 
-    log(`[FTP] Navigating to directory: ${FTP_REMOTE_DIR}`);
-    await client.ensureDir(FTP_REMOTE_DIR);
+    for (const job of jobs) {
+      if (!job.localFile || !fs.existsSync(job.localFile)) {
+        log(`[FTP][${job.label}] ⚠️  Skipping — local file not found.`);
+        continue;
+      }
 
-    const remoteName = path.basename(LOCAL_FILE);
-    log(`[FTP] Uploading: ${LOCAL_FILE} → ${FTP_REMOTE_DIR}/${remoteName}`);
-    await client.uploadFrom(LOCAL_FILE, remoteName);
+      const remoteName = path.basename(job.localFile);
+      log(`[FTP][${job.label}] Navigating to: ${job.ftpDir}`);
+      await client.ensureDir(job.ftpDir);
 
-    log(`[FTP] ✅ Upload complete: ${FTP_REMOTE_DIR}/${remoteName}`);
+      log(`[FTP][${job.label}] Uploading: ${remoteName}`);
+      await client.uploadFrom(job.localFile, remoteName);
+      log(`[FTP][${job.label}] ✅ Uploaded → ${job.ftpDir}/${remoteName}`);
+    }
   } finally {
     client.close();
     log('[FTP] Connection closed.');
   }
 }
 
-// ─── Cleanup temp file ─────────────────────────────────────────────
-function cleanup() {
-  if (fs.existsSync(LOCAL_FILE)) {
-    fs.unlinkSync(LOCAL_FILE);
-    log('[CLEANUP] Temp file removed.');
+// ─── Cleanup temp files ────────────────────────────────────────────
+function cleanup(jobs) {
+  for (const job of jobs) {
+    if (job.localFile && fs.existsSync(job.localFile)) {
+      fs.unlinkSync(job.localFile);
+      log(`[CLEANUP][${job.label}] Temp file removed.`);
+    }
   }
 }
 
 // ─── Full sync job ─────────────────────────────────────────────────
 async function runSync() {
-  log('═══════════════════════════════════════════');
-  log('🔄 Starting WheelPros SFTP → FTP sync...');
-  log('═══════════════════════════════════════════');
+  log('═══════════════════════════════════════════════════════');
+  log('🔄  Starting WheelPros SFTP → WheelsbelowRetail FTP sync');
+  log(`    Files: ${SYNC_JOBS.map(j => j.label).join(', ')}`);
+  log('═══════════════════════════════════════════════════════');
 
   try {
-    await downloadFromSftp();
-    await uploadToFtp();
-    cleanup();
-    log('✅ Sync completed successfully.');
+    await downloadAllFromSftp(SYNC_JOBS);
+    await uploadAllToFtp(SYNC_JOBS);
+    cleanup(SYNC_JOBS);
+    log('✅ All files synced successfully.');
   } catch (err) {
     log(`❌ Sync FAILED: ${err.message}`);
     console.error(err);
-    cleanup();
+    cleanup(SYNC_JOBS);
   }
 }
 
@@ -122,13 +148,11 @@ async function runSync() {
 const runOnce = process.argv.includes('--once');
 
 if (runOnce) {
-  // Single run then exit
   runSync().then(() => {
     log('Single-run mode: exiting.');
     process.exit(0);
   });
 } else {
-  // Validate cron expression
   if (!cron.validate(CRON_SCHEDULE)) {
     console.error(`❌ Invalid CRON_SCHEDULE: "${CRON_SCHEDULE}"`);
     process.exit(1);
@@ -137,10 +161,6 @@ if (runOnce) {
   log(`🕐 Scheduler started. Cron: "${CRON_SCHEDULE}"`);
   log('   Running first sync now...');
 
-  // Run immediately on start, then follow the schedule
   runSync();
-
-  cron.schedule(CRON_SCHEDULE, () => {
-    runSync();
-  });
+  cron.schedule(CRON_SCHEDULE, () => runSync());
 }
