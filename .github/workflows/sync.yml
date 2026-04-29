@@ -1,0 +1,56 @@
+name: WheelPros SFTP → FTP Sync
+
+on:
+  # ── Scheduled runs ─────────────────────────────────────────────
+  schedule:
+    - cron: '0 * * * *'   # every hour  (change to your preference)
+    # - cron: '0 */2 * * *'  # every 2 hours
+    # - cron: '0 6,14,22 * * *'  # 3x daily at 6am, 2pm, 10pm UTC
+
+  # ── Manual trigger from GitHub UI ──────────────────────────────
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Sync Inventory Feed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run sync (single pass)
+        env:
+          # ── SFTP Source (sftp.wheelpros.com) ──────────────────
+          SFTP_HOST:        ${{ secrets.SFTP_HOST }}
+          SFTP_PORT:        ${{ secrets.SFTP_PORT }}
+          SFTP_USER:        ${{ secrets.SFTP_USER }}
+          SFTP_PASS:        ${{ secrets.SFTP_PASS }}
+          SFTP_REMOTE_PATH: ${{ secrets.SFTP_REMOTE_PATH }}
+
+          # ── FTP Destination (ftp.wheelsbelowretail.com) ───────
+          FTP_HOST:         ${{ secrets.FTP_HOST }}
+          FTP_PORT:         ${{ secrets.FTP_PORT }}
+          FTP_USER:         ${{ secrets.FTP_USER }}
+          FTP_PASS:         ${{ secrets.FTP_PASS }}
+          FTP_REMOTE_DIR:   ${{ secrets.FTP_REMOTE_DIR }}
+
+        run: node sync.js --once
+
+      - name: Upload sync log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-log-${{ github.run_number }}
+          path: sync.log
+          retention-days: 7
