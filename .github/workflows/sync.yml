@@ -3,7 +3,7 @@ name: WheelPros SFTP → FTP Sync
 on:
   # ── Scheduled runs ─────────────────────────────────────────────
   schedule:
-    - cron: '0 * * * *'   # every hour  (change to your preference)
+    - cron: '0 */4 * * *'   # every 4 hours
     # - cron: '0 */2 * * *'  # every 2 hours
     # - cron: '0 6,14,22 * * *'  # 3x daily at 6am, 2pm, 10pm UTC
 
