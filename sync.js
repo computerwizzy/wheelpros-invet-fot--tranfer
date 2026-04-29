@@ -3,10 +3,12 @@
  * ───────────────────────────────────────────────────────────────────
  * WheelPros SFTP  →  WheelsbelowRetail FTP  inventory feed sync
  * Handles 2 files: TIRES and WHEELS (separate directories each)
+ * Skips upload if file has NOT changed since last sync.
  *
  * Usage:
  *   node sync.js          — starts the cron scheduler (keeps running)
  *   node sync.js --once   — runs a single sync and exits
+ *   node sync.js --force  — forces sync even if files haven't changed
  * ───────────────────────────────────────────────────────────────────
  */
 
@@ -19,10 +21,13 @@ const path       = require('path');
 
 // ─── Config from .env ──────────────────────────────────────────────
 const SFTP_CONFIG = {
-  host:     process.env.SFTP_HOST,
-  port:     parseInt(process.env.SFTP_PORT || '22'),
-  username: process.env.SFTP_USER,
-  password: process.env.SFTP_PASS,
+  host:         process.env.SFTP_HOST,
+  port:         parseInt(process.env.SFTP_PORT || '22'),
+  username:     process.env.SFTP_USER,
+  password:     process.env.SFTP_PASS,
+  tryKeyboard:  true,
+  readyTimeout: 20000,
+  hostVerifier: () => true,
 };
 
 const FTP_CONFIG = {
@@ -30,10 +35,9 @@ const FTP_CONFIG = {
   port:     parseInt(process.env.FTP_PORT || '21'),
   user:     process.env.FTP_USER,
   password: process.env.FTP_PASS,
+  secure:   false,
 };
 
-// ─── File transfer jobs ────────────────────────────────────────────
-// Each entry: { label, sftpPath, ftpDir }
 const SYNC_JOBS = [
   {
     label:    'TIRES',
@@ -47,13 +51,13 @@ const SYNC_JOBS = [
   },
 ];
 
-const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '0 * * * *';
+const CRON_SCHEDULE  = process.env.CRON_SCHEDULE || '0 */4 * * *';
+const TMP_DIR        = path.join(__dirname, 'tmp');
+const STATE_FILE     = path.join(__dirname, 'last-sync.json');
 
-// ─── Temp dir ──────────────────────────────────────────────────────
-const TMP_DIR = path.join(__dirname, 'tmp');
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
 
-// ─── Logging helper ────────────────────────────────────────────────
+// ─── Logging ───────────────────────────────────────────────────────
 function log(msg) {
   const ts   = new Date().toISOString();
   const line = `[${ts}] ${msg}`;
@@ -61,46 +65,78 @@ function log(msg) {
   fs.appendFileSync(path.join(__dirname, 'sync.log'), line + '\n');
 }
 
-// ─── Step 1: Download all files from SFTP (single connection) ──────
-async function downloadAllFromSftp(jobs) {
-  const sftp = new SftpClient();
+// ─── State: track last synced modification times ───────────────────
+function loadState() {
+  if (!fs.existsSync(STATE_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
+  catch { return {}; }
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+// ─── Step 1: Check + Download changed files from SFTP ──────────────
+async function downloadChangedFiles(jobs, force = false) {
+  const sftp  = new SftpClient();
+  const state = loadState();
+  let   anyChanged = false;
+
   try {
     log(`[SFTP] Connecting to ${SFTP_CONFIG.host}:${SFTP_CONFIG.port}...`);
     await sftp.connect(SFTP_CONFIG);
     log('[SFTP] ✅ Connected.');
 
     for (const job of jobs) {
-      const localFile = path.join(TMP_DIR, path.basename(job.sftpPath));
-      job.localFile   = localFile; // store for FTP upload step
+      log(`[SFTP][${job.label}] Checking modification time: ${job.sftpPath}`);
 
-      log(`[SFTP][${job.label}] Downloading: ${job.sftpPath}`);
+      const stat    = await sftp.stat(job.sftpPath);
+      const remoteModified = stat.modifyTime; // ms timestamp
+      const lastSynced     = state[job.label]?.modifyTime || 0;
+
+      if (!force && remoteModified <= lastSynced) {
+        log(`[SFTP][${job.label}] ⏭  No change detected (last synced: ${new Date(lastSynced).toISOString()}). Skipping.`);
+        job.skip = true;
+        continue;
+      }
+
+      log(`[SFTP][${job.label}] 🆕 File is newer — downloading...`);
+      const localFile  = path.join(TMP_DIR, path.basename(job.sftpPath));
+      job.localFile    = localFile;
+      job.modifyTime   = remoteModified;
+      job.skip         = false;
+
       await sftp.fastGet(job.sftpPath, localFile);
-
       const size = fs.statSync(localFile).size;
-      log(`[SFTP][${job.label}] ✅ Done — ${(size / 1024).toFixed(1)} KB`);
+      log(`[SFTP][${job.label}] ✅ Downloaded — ${(size / 1024).toFixed(1)} KB`);
+      anyChanged = true;
     }
   } finally {
     await sftp.end();
     log('[SFTP] Connection closed.');
   }
+
+  return anyChanged;
 }
 
-// ─── Step 2: Upload all files to FTP (single connection) ───────────
-async function uploadAllToFtp(jobs) {
+// ─── Step 2: Upload changed files to FTP ───────────────────────────
+async function uploadChangedFiles(jobs) {
+  const toUpload = jobs.filter(j => !j.skip && j.localFile);
+  if (toUpload.length === 0) {
+    log('[FTP] Nothing to upload — all files are current.');
+    return;
+  }
+
   const client = new ftp.Client();
   client.ftp.verbose = false;
+  const state = loadState();
 
   try {
     log(`[FTP] Connecting to ${FTP_CONFIG.host}:${FTP_CONFIG.port}...`);
     await client.access(FTP_CONFIG);
     log('[FTP] ✅ Connected.');
 
-    for (const job of jobs) {
-      if (!job.localFile || !fs.existsSync(job.localFile)) {
-        log(`[FTP][${job.label}] ⚠️  Skipping — local file not found.`);
-        continue;
-      }
-
+    for (const job of toUpload) {
       const remoteName = path.basename(job.localFile);
       log(`[FTP][${job.label}] Navigating to: ${job.ftpDir}`);
       await client.ensureDir(job.ftpDir);
@@ -108,6 +144,10 @@ async function uploadAllToFtp(jobs) {
       log(`[FTP][${job.label}] Uploading: ${remoteName}`);
       await client.uploadFrom(job.localFile, remoteName);
       log(`[FTP][${job.label}] ✅ Uploaded → ${job.ftpDir}/${remoteName}`);
+
+      // Save the synced modifyTime so next run can compare
+      state[job.label] = { modifyTime: job.modifyTime, syncedAt: new Date().toISOString() };
+      saveState(state);
     }
   } finally {
     client.close();
@@ -126,17 +166,26 @@ function cleanup(jobs) {
 }
 
 // ─── Full sync job ─────────────────────────────────────────────────
-async function runSync() {
+async function runSync(force = false) {
   log('═══════════════════════════════════════════════════════');
-  log('🔄  Starting WheelPros SFTP → WheelsbelowRetail FTP sync');
+  log(`🔄  WheelPros SFTP → WheelsbelowRetail FTP sync${force ? ' (FORCED)' : ''}`);
   log(`    Files: ${SYNC_JOBS.map(j => j.label).join(', ')}`);
   log('═══════════════════════════════════════════════════════');
 
+  // Reset job state for this run
+  SYNC_JOBS.forEach(j => { j.skip = false; j.localFile = null; j.modifyTime = null; });
+
   try {
-    await downloadAllFromSftp(SYNC_JOBS);
-    await uploadAllToFtp(SYNC_JOBS);
+    const anyChanged = await downloadChangedFiles(SYNC_JOBS, force);
+
+    if (!anyChanged) {
+      log('✅ All files are up to date — nothing to upload.');
+    } else {
+      await uploadChangedFiles(SYNC_JOBS);
+    }
+
     cleanup(SYNC_JOBS);
-    log('✅ All files synced successfully.');
+    log('✅ Sync run complete.');
   } catch (err) {
     log(`❌ Sync FAILED: ${err.message}`);
     console.error(err);
@@ -146,10 +195,11 @@ async function runSync() {
 
 // ─── Entry point ───────────────────────────────────────────────────
 const runOnce = process.argv.includes('--once');
+const force   = process.argv.includes('--force');
 
-if (runOnce) {
-  runSync().then(() => {
-    log('Single-run mode: exiting.');
+if (runOnce || force) {
+  runSync(force).then(() => {
+    log('Exiting.');
     process.exit(0);
   });
 } else {
