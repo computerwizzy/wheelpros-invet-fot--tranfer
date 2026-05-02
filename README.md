@@ -1,5 +1,5 @@
-# WheelPros Inventory Feed Sync
-**SFTP (sftp.wheelpros.com) → FTP (ftp.wheelsbelowretail.com) automated sync**
+# products Inventory Feed Sync
+**SFTP (sftp.yoursource.com) → FTP (ftp.yourftp.com) automated sync**
 
 ---
 
