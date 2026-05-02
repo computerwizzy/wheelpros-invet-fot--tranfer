@@ -13,12 +13,12 @@ npm install
 ### 2. Configure credentials
 Edit `.env` and fill in all values:
 ```
-SFTP_HOST=sftp.wheelpros.com
+SFTP_HOST=sftp.yoursourcefeed.com
 SFTP_USER=your_username
 SFTP_PASS=your_password
 SFTP_REMOTE_PATH=/path/to/inventory.csv
 
-FTP_HOST=ftp.wheelsbelowretail.com
+FTP_HOST=ftp.yourdomain.com
 FTP_USER=your_username
 FTP_PASS=your_password
 FTP_REMOTE_DIR=/public_html/feeds
