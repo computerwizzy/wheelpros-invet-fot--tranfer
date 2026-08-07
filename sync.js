@@ -34,24 +34,47 @@ const cron       = require('node-cron');
 const fs         = require('fs');
 const path       = require('path');
 
-// ─── Config from .env ──────────────────────────────────────────────
-const SFTP_CONFIG = {
-  host:         process.env.SFTP_HOST,
-  port:         parseInt(process.env.SFTP_PORT || '22'),
-  username:     process.env.SFTP_USER,
-  password:     process.env.SFTP_PASS,
-  tryKeyboard:  true,
-  readyTimeout: 20000,
-  hostVerifier: () => true,
-};
+// ─── Config Helpers ────────────────────────────────────────────────
+function getSftpConfig() {
+  return {
+    host:         process.env.SFTP_HOST,
+    port:         parseInt(process.env.SFTP_PORT || '22'),
+    username:     process.env.SFTP_USER,
+    password:     process.env.SFTP_PASS,
+    tryKeyboard:  true,
+    readyTimeout: 20000,
+    retries:      2,
+    hostVerifier: (keyBuffer) => {
+      const knownFingerprint = process.env.SFTP_FINGERPRINT;
+      if (!knownFingerprint) return true;
 
-const FTP_CONFIG = {
-  host:     process.env.FTP_HOST,
-  port:     parseInt(process.env.FTP_PORT || '21'),
-  user:     process.env.FTP_USER,
-  password: process.env.FTP_PASS,
-  secure:   false,
-};
+      // Convert key buffer to base64 (matching test-connections.js logic)
+      const b64 = keyBuffer.toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+      if (!knownFingerprint.includes(b64)) {
+        log(`[SFTP] ❌ Host fingerprint mismatch!`);
+        log(`[SFTP] Expected: ${knownFingerprint}`);
+        log(`[SFTP] Got:      ...${b64.slice(-20)}`);
+        return false; // Reject connection
+      }
+      return true;
+    },
+  };
+}
+
+function getFtpConfig() {
+  return {
+    host:     process.env.FTP_HOST,
+    port:     parseInt(process.env.FTP_PORT || '21'),
+    user:     process.env.FTP_USER,
+    password: process.env.FTP_PASS,
+    secure:   process.env.FTP_SECURE === 'true',
+    secureOptions: {
+      rejectUnauthorized: process.env.FTP_REJECT_UNAUTHORIZED !== 'false',
+    },
+  };
+}
 
 const SYNC_JOBS = [
   {
@@ -97,34 +120,48 @@ async function downloadChangedFiles(jobs, force = false) {
   const state = loadState();
   let   anyChanged = false;
 
+  const config = getSftpConfig();
+
   try {
-    log(`[SFTP] Connecting to ${SFTP_CONFIG.host}:${SFTP_CONFIG.port}...`);
-    await sftp.connect(SFTP_CONFIG);
+    log(`[SFTP] Connecting to ${config.host}:${config.port}...`);
+    await sftp.connect(config);
     log('[SFTP] ✅ Connected.');
 
     for (const job of jobs) {
-      log(`[SFTP][${job.label}] Checking modification time: ${job.sftpPath}`);
+      try {
+        log(`[SFTP][${job.label}] Checking modification time: ${job.sftpPath}`);
 
-      const stat    = await sftp.stat(job.sftpPath);
-      const remoteModified = stat.modifyTime; // ms timestamp
-      const lastSynced     = state[job.label]?.modifyTime || 0;
+        const exists = await sftp.exists(job.sftpPath);
+        if (!exists) {
+          log(`[SFTP][${job.label}] ❌ File not found on remote server. Skipping.`);
+          job.skip = true;
+          continue;
+        }
 
-      if (!force && remoteModified <= lastSynced) {
-        log(`[SFTP][${job.label}] ⏭  No change detected (last synced: ${new Date(lastSynced).toISOString()}). Skipping.`);
+        const stat    = await sftp.stat(job.sftpPath);
+        const remoteModified = stat.modifyTime; // ms timestamp
+        const lastSynced     = state[job.label]?.modifyTime || 0;
+
+        if (!force && remoteModified <= lastSynced) {
+          log(`[SFTP][${job.label}] ⏭  No change detected (last synced: ${new Date(lastSynced).toISOString()}). Skipping.`);
+          job.skip = true;
+          continue;
+        }
+
+        log(`[SFTP][${job.label}] 🆕 File is newer — downloading...`);
+        const localFile  = path.join(TMP_DIR, `${job.label}-${path.basename(job.sftpPath)}`);
+        job.localFile    = localFile;
+        job.modifyTime   = remoteModified;
+        job.skip         = false;
+
+        await sftp.fastGet(job.sftpPath, localFile);
+        const size = fs.statSync(localFile).size;
+        log(`[SFTP][${job.label}] ✅ Downloaded — ${(size / 1024).toFixed(1)} KB`);
+        anyChanged = true;
+      } catch (jobErr) {
+        log(`[SFTP][${job.label}] ❌ Error processing job: ${jobErr.message}`);
         job.skip = true;
-        continue;
       }
-
-      log(`[SFTP][${job.label}] 🆕 File is newer — downloading...`);
-      const localFile  = path.join(TMP_DIR, path.basename(job.sftpPath));
-      job.localFile    = localFile;
-      job.modifyTime   = remoteModified;
-      job.skip         = false;
-
-      await sftp.fastGet(job.sftpPath, localFile);
-      const size = fs.statSync(localFile).size;
-      log(`[SFTP][${job.label}] ✅ Downloaded — ${(size / 1024).toFixed(1)} KB`);
-      anyChanged = true;
     }
   } finally {
     await sftp.end();
@@ -145,24 +182,29 @@ async function uploadChangedFiles(jobs) {
   const client = new ftp.Client();
   client.ftp.verbose = false;
   const state = loadState();
+  const config = getFtpConfig();
 
   try {
-    log(`[FTP] Connecting to ${FTP_CONFIG.host}:${FTP_CONFIG.port}...`);
-    await client.access(FTP_CONFIG);
+    log(`[FTP] Connecting to ${config.host}:${config.port}...`);
+    await client.access(config);
     log('[FTP] ✅ Connected.');
 
     for (const job of toUpload) {
-      const remoteName = path.basename(job.localFile);
-      log(`[FTP][${job.label}] Navigating to: ${job.ftpDir}`);
-      await client.ensureDir(job.ftpDir);
+      try {
+        const remoteName = path.basename(job.sftpPath);
+        log(`[FTP][${job.label}] Navigating to: ${job.ftpDir}`);
+        await client.ensureDir(job.ftpDir);
 
-      log(`[FTP][${job.label}] Uploading: ${remoteName}`);
-      await client.uploadFrom(job.localFile, remoteName);
-      log(`[FTP][${job.label}] ✅ Uploaded → ${job.ftpDir}/${remoteName}`);
+        log(`[FTP][${job.label}] Uploading: ${remoteName}`);
+        await client.uploadFrom(job.localFile, remoteName);
+        log(`[FTP][${job.label}] ✅ Uploaded → ${job.ftpDir}/${remoteName}`);
 
-      // Save the synced modifyTime so next run can compare
-      state[job.label] = { modifyTime: job.modifyTime, syncedAt: new Date().toISOString() };
-      saveState(state);
+        // Save the synced modifyTime so next run can compare
+        state[job.label] = { modifyTime: job.modifyTime, syncedAt: new Date().toISOString() };
+        saveState(state);
+      } catch (jobErr) {
+        log(`[FTP][${job.label}] ❌ Upload FAILED: ${jobErr.message}`);
+      }
     }
   } finally {
     client.close();

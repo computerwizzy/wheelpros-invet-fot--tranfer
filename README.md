@@ -12,18 +12,27 @@ npm install
 
 ### 2. Configure credentials
 Edit `.env` and fill in all values:
-```
-SFTP_HOST=sftp.yoursourcefeed.com
+```bash
+# SFTP Source (WheelPros)
+SFTP_HOST=sftp.wheelpros.com
+SFTP_PORT=22
 SFTP_USER=your_username
 SFTP_PASS=your_password
-SFTP_REMOTE_PATH=/path/to/inventory.csv
+SFTP_TIRES_PATH=/path/to/tires.csv
+SFTP_WHEELS_PATH=/path/to/wheels.csv
+SFTP_FINGERPRINT=optional_base64_fingerprint
 
+# FTP Destination (WheelsbelowRetail)
 FTP_HOST=ftp.yourdomain.com
+FTP_PORT=21
 FTP_USER=your_username
 FTP_PASS=your_password
-FTP_REMOTE_DIR=/public_html/feeds
+FTP_TIRES_DIR=/public_html/tires
+FTP_WHEELS_DIR=/public_html/wheels
+FTP_SECURE=false               # Set to true for FTPS
+FTP_REJECT_UNAUTHORIZED=true   # Set to false to allow self-signed certificates
 
-CRON_SCHEDULE=0 * * * *   # every hour
+CRON_SCHEDULE=0 */4 * * *   # every 4 hours
 ```
 
 ### 3. Test connections before running
