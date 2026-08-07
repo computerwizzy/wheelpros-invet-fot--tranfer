@@ -1,5 +1,5 @@
-# products Inventory Feed Sync
-**SFTP (sftp.yoursource.com) → FTP (ftp.yourftp.com) automated sync**
+# WheelPros Inventory Feed Sync
+**SFTP (sftp.wheelpros.com) → FTP (ftp.wheelsbelowretail.com) automated sync**
 
 ---
 
@@ -13,17 +13,24 @@ npm install
 ### 2. Configure credentials
 Edit `.env` and fill in all values:
 ```
-SFTP_HOST=sftp.yoursourcefeed.com
+SFTP_HOST=sftp.wheelpros.com
 SFTP_USER=your_username
 SFTP_PASS=your_password
-SFTP_REMOTE_PATH=/path/to/inventory.csv
+SFTP_TIRES_PATH=/path/to/tires.csv
+SFTP_WHEELS_PATH=/path/to/wheels.csv
 
-FTP_HOST=ftp.yourdomain.com
+FTP_HOST=ftp.wheelsbelowretail.com
 FTP_USER=your_username
 FTP_PASS=your_password
-FTP_REMOTE_DIR=/public_html/feeds
+FTP_TIRES_DIR=/public_html/tires
+FTP_WHEELS_DIR=/public_html/wheels
 
-CRON_SCHEDULE=0 * * * *   # every hour
+CRON_SCHEDULE=0 */4 * * *   # every 4 hours
+
+# Optional: Host verification (highly recommended)
+# To get the SFTP fingerprint, run:
+# ssh-keyscan -p 22 sftp.wheelpros.com | ssh-keygen -lf -
+SFTP_FINGERPRINT=...
 ```
 
 ### 3. Test connections before running

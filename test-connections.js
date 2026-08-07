@@ -94,41 +94,46 @@ async function testFtp() {
     console.log(`Host : ${process.env.FTP_HOST}:${process.env.FTP_PORT || 21}`);
     console.log(`User : ${process.env.FTP_USER}`);
 
-    // Try plain FTP first, then explicit TLS if it fails
+    // Try FTPS first by default
     let connected = false;
+    const useSecure = process.env.FTP_SECURE !== 'false';
 
-    try {
-      console.log('   Trying plain FTP...');
-      await client.access({
-        host:     process.env.FTP_HOST,
-        port:     parseInt(process.env.FTP_PORT || '21'),
-        user:     process.env.FTP_USER,
-        password: process.env.FTP_PASS,
-        secure:   false,
-      });
-      connected = true;
-      console.log('✅ FTP connected (plain)!\n');
-    } catch (e1) {
-      console.log(`   Plain FTP failed: ${e1.message}`);
-      console.log('   Trying explicit TLS (FTPS)...');
+    if (useSecure) {
       try {
-        client.close();
-        const client2 = new ftp.Client();
-        await client2.access({
+        console.log('   Trying explicit TLS (FTPS)...');
+        await client.access({
           host:                process.env.FTP_HOST,
           port:                parseInt(process.env.FTP_PORT || '21'),
           user:                process.env.FTP_USER,
           password:            process.env.FTP_PASS,
           secure:              true,
-          secureOptions:       { rejectUnauthorized: false },
+          secureOptions:       {
+            rejectUnauthorized: process.env.FTP_REJECT_UNAUTHORIZED !== 'false'
+          },
         });
         connected = true;
         console.log('✅ FTP connected (explicit TLS/FTPS)!\n');
-        // swap client reference for listing
-        Object.assign(client, client2);
-      } catch (e2) {
-        console.log(`   Explicit TLS failed: ${e2.message}`);
-        throw new Error('Both plain FTP and FTPS failed.');
+      } catch (e) {
+        console.log(`   Explicit TLS failed: ${e.message}`);
+      }
+    }
+
+    if (!connected) {
+      try {
+        console.log('   Trying plain FTP...');
+        client.close();
+        await client.access({
+          host:     process.env.FTP_HOST,
+          port:     parseInt(process.env.FTP_PORT || '21'),
+          user:     process.env.FTP_USER,
+          password: process.env.FTP_PASS,
+          secure:   false,
+        });
+        connected = true;
+        console.log('✅ FTP connected (plain)!\n');
+      } catch (e) {
+        console.log(`   Plain FTP failed: ${e.message}`);
+        throw new Error('Both plain FTP and FTPS failed (or FTPS failed and plain not attempted/failed).');
       }
     }
 

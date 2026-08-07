@@ -42,7 +42,17 @@ const SFTP_CONFIG = {
   password:     process.env.SFTP_PASS,
   tryKeyboard:  true,
   readyTimeout: 20000,
-  hostVerifier: () => true,
+  hostVerifier: (hashedKey) => {
+    const knownFingerprint = process.env.SFTP_FINGERPRINT;
+    if (!knownFingerprint) return true;
+    const b64 = hashedKey.toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const match = knownFingerprint.includes(b64);
+    if (!match) {
+      log(`[SFTP] ❌ Host fingerprint mismatch! Expected: ${knownFingerprint}, Got: ...${b64.slice(-20)}`);
+    }
+    return match;
+  },
 };
 
 const FTP_CONFIG = {
@@ -50,7 +60,10 @@ const FTP_CONFIG = {
   port:     parseInt(process.env.FTP_PORT || '21'),
   user:     process.env.FTP_USER,
   password: process.env.FTP_PASS,
-  secure:   false,
+  secure:   process.env.FTP_SECURE !== 'false',
+  secureOptions: {
+    rejectUnauthorized: process.env.FTP_REJECT_UNAUTHORIZED !== 'false'
+  }
 };
 
 const SYNC_JOBS = [
@@ -147,9 +160,23 @@ async function uploadChangedFiles(jobs) {
   const state = loadState();
 
   try {
-    log(`[FTP] Connecting to ${FTP_CONFIG.host}:${FTP_CONFIG.port}...`);
-    await client.access(FTP_CONFIG);
-    log('[FTP] ✅ Connected.');
+    log(`[FTP] Connecting to ${FTP_CONFIG.host}:${FTP_CONFIG.port} (secure: ${FTP_CONFIG.secure})...`);
+    try {
+      await client.access(FTP_CONFIG);
+      log(`[FTP] ✅ Connected (${FTP_CONFIG.secure ? 'FTPS' : 'plain'}).`);
+    } catch (e) {
+      if (FTP_CONFIG.secure) {
+        log(`[FTP] FTPS connection failed: ${e.message}. Trying plain FTP...`);
+        client.close();
+        await client.access({
+          ...FTP_CONFIG,
+          secure: false
+        });
+        log('[FTP] ✅ Connected (plain fallback).');
+      } else {
+        throw e;
+      }
+    }
 
     for (const job of toUpload) {
       const remoteName = path.basename(job.localFile);
